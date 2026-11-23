@@ -96,6 +96,16 @@ on:
         options:
           - kernel-config/release/rk35xx
           - false
+      kernel_patch:
+        description: "Select the kernel patch directory"
+        required: false
+        default: "kernel-patch/beta"
+        type: string
+      auto_patch:
+        description: "Auto use kernel patches"
+        required: false
+        default: true
+        type: boolean
 
 env:
   TZ: Etc/UTC
@@ -191,6 +201,8 @@ jobs:
           kernel_toolchain: ${{ inputs.kernel_toolchain }}
           kernel_sign: ${{ inputs.kernel_sign }}
           kernel_config: ${{ inputs.kernel_config }}
+          kernel_patch: ${{ inputs.kernel_patch }}
+          auto_patch: ${{ inputs.auto_patch }}
           ccache_clear: ${{ inputs.ccache_clear }}
           docker_hostpath: /builder
           docker_image: ophub/armbian-${{ inputs.docker_image }}:arm64
