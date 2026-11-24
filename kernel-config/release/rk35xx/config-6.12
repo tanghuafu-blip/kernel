@@ -10330,3 +10330,6 @@ CONFIG_MEMTEST=y
 #
 # end of Rust hacking
 # end of Kernel hacking
+
+# OpenAppFilter 7.0.2 (rk35xx 6.12)
+CONFIG_OPENAPPFILTER=m
