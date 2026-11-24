@@ -1,0 +1,174 @@
+#==========================================================================
+# Description: Compile OpenAppFilter (OAF 7.0.2) kernel module only
+#              不编译整个内核，只产出 oaf.ko（约 1-2 分钟/每个版本）
+#
+# 原理：从 kernel release 里取已经编译好的 header-<版本>.tar.gz
+#       （内含 Makefile / Module.symvers / include/config/kernel.release / scripts），
+#       把补丁里的 drivers/net/oaf/ 源码抽出来，直接用这套头文件编译外部模块。
+#       这样 vermagic 与已发布的内核完全一致，不需要重新编内核。
+#
+# 注意：必须跑在 aarch64 runner 上（header 包里的 modpost/fixdep 是 arm64 程序）
+#==========================================================================
+
+name: Compile oaf kernel module
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Take the kernel headers from which release"
+        required: false
+        default: "kernel_stable"
+        type: choice
+        options:
+          - kernel_stable
+          - kernel_rk35xx
+          - kernel_rk3588
+      oaf_version:
+        description: "Kernel version: latest / all / 6.18.64 / 6.18.64 6.12.81"
+        required: false
+        default: "latest"
+        type: string
+      upload_to_release:
+        description: "Publish the .ko files to the oaf_module release"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  TZ: Etc/UTC
+  OAF_TAG: oaf_module
+
+jobs:
+  build:
+    # 必须是 arm64 机器：header 包里 modpost / fixdep 是 aarch64 可执行文件
+    # 如果 26.04-arm 排队太久，可换成 ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          echo "arch: $(uname -m)"
+          gcc --version | head -1
+          strip --version | head -1
+
+      - name: Build oaf.ko
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          REQ: ${{ inputs.oaf_version }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com"
+
+          # 1) 取该 release 里所有内核版本（排除 deb-*.tar.gz 等）
+          ALL="$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
+            "${API}/repos/${REPO}/releases/tags/${TAG}" \
+            | jq -r '.assets[]?.name' \
+            | grep -E '^[0-9]+(\.[0-9]+)+\.tar\.gz$' \
+            | sed 's/\.tar\.gz$//' | sort -V)"
+          [[ -n "${ALL}" ]] || { echo "::error::${TAG} 里没有内核包"; exit 1; }
+          echo "可用版本: $(echo ${ALL} | tr '\n' ' ')"
+
+          # 2) 解析要编哪些
+          case "${REQ}" in
+            all)    VERS="${ALL}" ;;
+            latest) VERS="$(echo "${ALL}" | tail -1)" ;;
+            *)      VERS="${REQ}" ;;
+          esac
+
+          mkdir -p out work
+          echo "" > out/build-report.txt
+
+          for VER in ${VERS}; do
+            echo "==================== ${VER} ===================="
+            SER="$(echo "${VER}" | awk -F. '{print $1"."$2}')"
+
+            # 3) 选补丁：优先 linux-<系列>.y，其次 linux-<系列>.y-*（rockchip 那种）
+            PDIR=""
+            [[ -d "kernel-patch/beta/linux-${SER}.y" ]] && PDIR="kernel-patch/beta/linux-${SER}.y"
+            if [[ -z "${PDIR}" ]]; then
+              PDIR="$(ls -d kernel-patch/beta/linux-${SER}.y-* 2>/dev/null | head -1 || true)"
+            fi
+            PATCH="$(ls ${PDIR}/*oaf*.patch 2>/dev/null | head -1 || true)"
+            [[ -n "${PATCH}" ]] || { echo "::error::没有找到 ${SER} 的 oaf 补丁"; exit 1; }
+            echo "补丁: ${PATCH}"
+
+            rm -rf "work/${VER}"
+            mkdir -p "work/${VER}"
+            cd "work/${VER}"
+
+            # 4) 下载内核包，只解出 header
+            curl -fsSL -o k.tar.gz \
+              "https://github.com/${REPO}/releases/download/${TAG}/${VER}.tar.gz"
+            tar xzf k.tar.gz
+            mkdir -p hdr
+            tar xzf "${VER}"/header-*.tar.gz -C hdr
+            KREL="$(cat hdr/include/config/kernel.release)"
+            echo "目标内核: ${KREL}"
+
+            # 5) 只从补丁里抽 drivers/net/oaf/ 的源码（Kconfig/Makefile 接线不需要）
+            mkdir -p src
+            cd src
+            git init -q .
+            git apply -p1 --include='drivers/net/oaf/*' \
+              "${GITHUB_WORKSPACE}/${PATCH}" 2>/dev/null \
+              || git apply -p1 --include='drivers/net/oaf/*' --whitespace=nowarn \
+              "${GITHUB_WORKSPACE}/${PATCH}"
+            cd ..
+            [[ -f src/drivers/net/oaf/Makefile ]] || { echo "::error::源码抽取失败"; exit 1; }
+
+            # 6) 编模块（本机就是 arm64，不需要交叉工具链）
+            make -C hdr ARCH=arm64 M="${PWD}/src/drivers/net/oaf" \
+              CONFIG_OPENAPPFILTER=m modules
+
+            # 7) strip + 改名
+            cp src/drivers/net/oaf/oaf.ko "${GITHUB_WORKSPACE}/out/oaf-${KREL}.ko"
+            strip --strip-debug "${GITHUB_WORKSPACE}/out/oaf-${KREL}.ko"
+            VM="$(strings "${GITHUB_WORKSPACE}/out/oaf-${KREL}.ko" | grep -m1 '^vermagic=' || true)"
+            SZ="$(du -h "${GITHUB_WORKSPACE}/out/oaf-${KREL}.ko" | cut -f1)"
+            echo "${KREL}  ${SZ}  ${VM}" | tee -a "${GITHUB_WORKSPACE}/out/build-report.txt"
+            echo "::notice::产出了 oaf-${KREL}.ko (${SZ})"
+            cd "${GITHUB_WORKSPACE}"
+          done
+
+          # 8) 汇总
+          echo "--- 产出 ---"
+          cat out/build-report.txt
+          echo "outputs<<EOF" >> "${GITHUB_OUTPUT}"
+          ls out/*.ko | xargs -n1 basename | tr '\n' ' ' >> "${GITHUB_OUTPUT}"
+          echo "" >> "${GITHUB_OUTPUT}"
+          echo "EOF" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oaf-ko
+          path: out/*.ko
+
+      - name: Publish to release [ ${{ env.OAF_TAG }} ]
+        if: ${{ inputs.upload_to_release && steps.build.outputs.outputs != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.OAF_TAG }}
+          name: OAF 7.0.2 kernel modules
+          body: |
+            OpenAppFilter 7.0.2 独立内核模块（按已发布内核的 header 编译，vermagic 与内核一致）。
+
+            用法：
+            ```shell
+            cp oaf-<vermagic>.ko /lib/modules/$(uname -r)/kernel/drivers/net/oaf/
+            depmod -a $(uname -r)
+            modprobe oaf && lsmod | grep oaf
+            ```
+          files: out/*.ko
+          make_latest: false
+          fail_on_unmatched_files: false
